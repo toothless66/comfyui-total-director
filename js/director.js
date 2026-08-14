@@ -89,6 +89,8 @@
     wrap.appendChild(body);
     document.body.appendChild(wrap);
 
+    self._loadSettings();
+
     var btn = h("button", "td-toggle", "\u5bfc\u6f14");
     btn.setAttribute("aria-label", "TotalDirector toggle");
     btn.setAttribute("data-td", "toggle");
