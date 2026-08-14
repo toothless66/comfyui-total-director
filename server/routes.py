@@ -40,6 +40,8 @@ def _plan_preview(plan):
     return {
         "pipeline": plan["pipeline"],
         "summary_cn": plan["summary_cn"],
+        "design_cn": plan.get("design_cn") or "",
+        "mood_tags_cn": plan.get("mood_tags_cn") or "",
         "duration_s": plan["duration_s"],
         "frames": workflow.frame_length(plan["duration_s"]),
         "aspect": plan["aspect"],
@@ -54,6 +56,19 @@ def _plan_preview(plan):
         "notes_cn": plan["notes_cn"],
         "megaprompt_preview": plan["megaprompt"][:400],
         "roles": (plan.get("_meta") or {}).get("roles") or None,
+        "scenes": [
+            {
+                "id": sc["id"],
+                "title_cn": sc["title_cn"],
+                "summary_cn": sc["summary_cn"],
+                "duration_s": sc["duration_s"],
+                "aspect": sc["aspect"],
+                "width": workflow.compute_dimensions(sc["aspect"], sc["megapixels"])[0],
+                "height": workflow.compute_dimensions(sc["aspect"], sc["megapixels"])[1],
+                "megaprompt_preview": (sc.get("megaprompt") or "")[:200],
+            }
+            for sc in (plan.get("scenes") or [])
+        ],
     }
 
 
@@ -98,8 +113,19 @@ async def handle_plan(request):
         plan = await llm.plan(message, snap, images=images)
     except llm.LLMError as e:
         return _bad(f"规划失败: {e}", status=502)
+    except Exception as e:  # pragma: no cover
+        import traceback
+        traceback.print_exc()
+        return _bad(f"规划异常: {e}", status=502)
 
-    return _ok(plan=plan, preview=_plan_preview(plan), model=plan.get("_meta"))
+    try:
+        preview = _plan_preview(plan)
+    except Exception as e:  # pragma: no cover
+        import traceback
+        traceback.print_exc()
+        return _bad(f"方案预览异常: {e}", status=502)
+
+    return _ok(plan=plan, preview=preview, model=plan.get("_meta"))
 
 
 async def handle_refine(request):
@@ -123,6 +149,19 @@ async def handle_build(request):
     plan = body.get("plan")
     if not plan:
         return _bad("缺少 plan")
+
+    # Optional: build a specific scene (multi-scene scripts).
+    scene_index = body.get("scene_index")
+    if scene_index is not None:
+        scenes = plan.get("scenes") or []
+        try:
+            scene_index = int(scene_index)
+        except (TypeError, ValueError):
+            return _bad("scene_index 非法")
+        if not 0 <= scene_index < len(scenes):
+            return _bad(f"场景索引越界: {scene_index} (共 {len(scenes)} 个场景)")
+        plan = dict(scenes[scene_index])
+        plan["_meta"] = (body.get("plan") or {}).get("_meta")
 
     snap = await _snapshot()
     pipeline = (plan.get("pipeline") or "t2v").strip()

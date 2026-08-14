@@ -20,6 +20,8 @@ Manually building an H3 workflow means dragging dozens of nodes, filling in unet
 
 - **Zero learning curve**: just speak plain language, e.g. *"a mechanical bird circling over a rain-soaked neon cyberpunk city, 3 seconds"*
 - **Four pipelines**: `t2v` text-to-video / `i2v` first-frame image-to-video / `r2v` reference-image-to-video / `sdxl2v` full SDXL keyframe pipeline
+- **Director-level design ability**: ships with a built-in design knowledge base (style library / camera language / color mood / pacing) — every plan gets a unique creative direction + mood tags
+- **Auto scene-splitting for long scripts**: paste a multi-scene storyboard and it splits into separate shots, each building its own workflow and rendering its own video
 - **Multi-model coordination (dual mode)**: deepseek plans the parameters & writes the prompt, qwen does the final review (producer's-eye check) — a real division of labor
 - **Always inspectable**: the generated plan is editable, and the assembled workflow lands on your canvas so you can see and tweak it
 - **True one-click**: from text to video with a single button, including progress monitoring and in-panel preview
@@ -45,6 +47,9 @@ Manually building an H3 workflow means dragging dozens of nodes, filling in unet
 | 2. Plan | Click **Generate Plan** and review how the Director breaks it down |
 | 3. Build | Click **Build & Load to Canvas**, tweak if needed |
 | 4. Render | Click **One-Click Render**; the panel shows progress and previews the result |
+
+> **Multi-scene scripts**: the Plan tab splits a long storyboard into scene cards; each card can
+> "Build & Run" independently, rendering its own video for easy per-shot editing.
 
 ### Dual mode (multi-model coordination)
 

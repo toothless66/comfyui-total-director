@@ -263,7 +263,7 @@ def build_sdxl2v(plan, env=None, cfg=None):
                    widget_input("latent_image", "LATENT", l_lat)],
         "outputs": [{"name": "LATENT", "type": "LATENT", "links": []}],
         "properties": {"Node name for S&R": "KSampler"},
-        "widgets_values": [plan["seed"], build.get("sdxl_steps", 28), build.get("sdxl_cfg", 7.0),
+        "widgets_values": [plan["seed"], "fixed", build.get("sdxl_steps", 28), build.get("sdxl_cfg", 7.0),
                            build.get("sdxl_sampler", "euler"), build.get("sdxl_scheduler", "normal"), 1.0],
     })
 

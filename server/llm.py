@@ -12,11 +12,40 @@ Supports:
 
 import asyncio
 import json
+import os
 import random
 
 import aiohttp
 
 from . import config
+
+_SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+
+
+def _load_design_skill():
+    """Load a condensed Director design digest (style/camera/mood/rhythm cues)."""
+    try:
+        p = os.path.join(_SKILLS_DIR, "design_skill.md")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                full = f.read()
+            # Condense: keep the style table + key camera/mood/rhythm lines only.
+            lines = full.splitlines()
+            keep = []
+            for ln in lines:
+                s = ln.strip()
+                if not s:
+                    continue
+                if s.startswith("#") and not s.startswith("## 风格库"):
+                    # keep only the main sections that matter most for Stage A
+                    if s.startswith("## 镜头语言") or s.startswith("## 色彩与情绪") or s.startswith("## 节奏设计"):
+                        keep.append(s)
+                elif s.startswith("|") or s.startswith("-") or s.startswith("*"):
+                    keep.append(s)
+            return "\n".join(keep)[:1400]
+    except Exception:
+        pass
+    return ""
 
 
 class LLMError(Exception):
@@ -36,33 +65,35 @@ _ENV_HINT = """Available pipelines:
 Current environment:
 {env}"""
 
-_STAGE_A_SYSTEM = """You are the "Total Director", an expert AI video director embedded inside ComfyUI.
-Read the user's creative brief or storyboard script (Chinese or English) and emit ONE strict JSON object with the production parameters for a MiniMax H3 video (an omni-modal model that generates VIDEO with NATIVE STEREO AUDIO in one pass; hardware is RTX 5060 Laptop 8GB VRAM, keep resolution modest).
+_STAGE_A_SYSTEM = """You are an AI video director producing a STRICT JSON production plan for MiniMax H3 (text+video+native stereo audio in one pass). RTX 5060 8GB VRAM, keep resolution modest.
 
 {env_hint}
 
-# Constraints
-- duration_s: 1.0 to 15.0. Default 5.0.
-- aspect: one of "16:9","9:16","1:1","4:3","3:2","2:3","3:4","21:9"
-- megapixels: 0.2 to 0.6 (8GB VRAM friendly). Default 0.4.
-- sampler: "res_multistep" (default) or a reasonable sampler.
-- steps: 10-30, default 20.
-- A single H3 generation is one continuous take of a few seconds; do NOT plan minutes-long video.
-- Choose pipeline to match the brief. If the brief implies a starting image, prefer i2v. If the brief asks to fully auto-produce (concept -> finished video), prefer sdxl2v. Plain text-to-video stays t2v.
+# Hard rules
+1. Summarize the user's brief faithfully. NEVER invent a theme the user did not mention.
+2. Scene splitting: COUNT explicit markers in the user text such as 场景N / 场景 N / Scene N / scene N / [0s-3s] / shot 1. If 2+ distinct markers exist, output one scene object per marker in "scenes". If 1 or none, output "scenes": [].
+3. Each scene = its own few-second H3 clip. Scenes share style/subject for continuity.
+4. pipeline: pure concept -> sdxl2v; image-led -> i2v; reference-led -> r2v; plain text -> t2v.
+5. duration_s 1-15 (default 5); aspect one of 16:9/9:16/1:1/4:3/3:2/2:3/3:4/21:9; megapixels 0.2-0.6 (default 0.4); steps 10-30 (default 20).
+6. design_cn: 40-120 Chinese chars, the CREATIVE DIRECTION for THIS brief (style, mood, camera language, pacing, why this pipeline). Must be specific, never generic.
+7. mood_tags_cn: 3-6 Chinese editorial keywords unique to this brief.
 
-# Output schema (STRICT JSON, no markdown fences, no extra text)
+# Output (STRICT JSON, NO markdown fences, NO extra text, NO comments)
 {{
   "pipeline": "t2v",
-  "summary_cn": "one short Chinese sentence summarizing the video concept",
+  "summary_cn": "",
+  "design_cn": "",
+  "mood_tags_cn": "",
   "duration_s": 5.0,
   "aspect": "16:9",
   "megapixels": 0.4,
   "sampler": "res_multistep",
   "steps": 20,
-  "audio": "short English note on the sound design",
-  "notes_cn": "short Chinese production notes or warnings",
-  "keyframe_prompt": "only for sdxl2v: SDXL still-image prompt in English (subject, composition, style, lighting), otherwise empty string",
-  "keyframe_negative": "only for sdxl2v: standard SDXL negatives, otherwise empty string"
+  "audio": "",
+  "notes_cn": "",
+  "keyframe_prompt": "",
+  "keyframe_negative": "",
+  "scenes": [{{"id": 1, "title_cn": "", "summary_cn": "", "duration_s": 5.0, "aspect": "16:9", "megapixels": 0.4}}]
 }}"""
 
 _STAGE_B_SYSTEM = """You are a screenwriter who writes the actual prompt that a video diffusion model (MiniMax H3) reads. Write ONLY the English prompt text the model will read. Do not write meta-commentary.
@@ -125,7 +156,14 @@ MEGAPROMPT MUST BE COMPLETE — never abbreviated, no ellipsis."""
 
 
 def _build_stage_a_system(env_text):
-    return _STAGE_A_SYSTEM.replace("{env_hint}", _ENV_HINT.replace("{env}", env_text))
+    base = _STAGE_A_SYSTEM.replace("{env_hint}", _ENV_HINT.replace("{env}", env_text))
+    skill = _load_design_skill()
+    if skill:
+        base = base.replace(
+            "# Output (STRICT JSON, NO markdown fences, NO extra text, NO comments)",
+            "Design cues (apply subtly):\n" + skill +
+            "\n\n# Output (STRICT JSON, NO markdown fences, NO extra text, NO comments)")
+    return base
 
 
 def _summarize_env(env):
@@ -245,7 +283,80 @@ def _extract_json(text):
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
         raise LLMError("LLM did not return a JSON object")
-    return json.loads(text[start:end + 1])
+    snippet = text[start:end + 1]
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError as e:
+        # Reasoning models often embed raw control characters (\n, \t, \r) inside
+        # string values, which strict json.loads rejects. Escape them and retry.
+        escaped = _escape_control_chars(snippet)
+        if escaped != snippet:
+            try:
+                return json.loads(escaped)
+            except json.JSONDecodeError:
+                pass
+        # Try once more: some reasoning models append a trailing stray brace/comment
+        # after the object, or leave an unclosed string. Attempt a repair.
+        repaired = _repair_json(escaped if escaped != snippet else snippet)
+        if repaired is not None:
+            return repaired
+        raise LLMError(f"LLM JSON parse failed: {e} (len={len(snippet)})") from e
+
+
+def _escape_control_chars(s):
+    """Escape raw control characters INSIDE string literals only (structural newlines stay)."""
+    out = []
+    i = 0
+    n = len(s)
+    in_str = False
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+                out.append(c)
+                i += 1
+                continue
+            o = ord(c)
+            if o < 0x20:
+                out.append("\\u%04x" % o)
+            else:
+                out.append(c)
+            i += 1
+        else:
+            if c == '"':
+                in_str = True
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _repair_json(snippet):
+    """Best-effort recovery for common JSON output issues from local LLMs."""
+    s = snippet
+    for _ in range(3):
+        # drop a possible trailing ] } ) comma or stray token after the final brace
+        m = s.rstrip()
+        if m and m[-1] in "])},.·":
+            s = m[:-1]
+        else:
+            break
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # unclosed string before a comma/brace: close it
+    try:
+        import re
+        fixed = re.sub(r'("(?:[^"\\]|\\.)*)\s*,(\s*[}\]])', r"\1\"\2", s)
+        return json.loads(fixed)
+    except (json.JSONDecodeError, re.error):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +427,8 @@ def normalize_plan(raw, env, cfg):
     return {
         "pipeline": pipeline,
         "summary_cn": str(raw.get("summary_cn") or "").strip() or f"{pipeline} 视频",
+        "design_cn": str(raw.get("design_cn") or "").strip(),
+        "mood_tags_cn": str(raw.get("mood_tags_cn") or "").strip(),
         "duration_s": round(duration, 1),
         "aspect": aspect,
         "aspect_label": aspect_label,
@@ -328,7 +441,26 @@ def normalize_plan(raw, env, cfg):
         "keyframe_prompt": str(raw.get("keyframe_prompt") or "").strip(),
         "keyframe_negative": str(raw.get("keyframe_negative") or "").strip()
         or str(build.get("sdxl_negative") or ""),
+        "scenes": _normalize_scenes(raw.get("scenes"), env, cfg),
     }
+
+
+def _normalize_scenes(raw_scenes, env, cfg):
+    """Normalize the scene split into a list of per-scene mini-plans."""
+    if not isinstance(raw_scenes, list):
+        return []
+    out = []
+    for sc in raw_scenes:
+        if not isinstance(sc, dict):
+            continue
+        s = dict(sc)
+        # Reuse normalize_plan on a flattened scene dict (recursion-safe: scenes=[]).
+        s.pop("scenes", None)
+        sub = normalize_plan(s, env, cfg)
+        sub["id"] = int(s.get("id") or (len(out) + 1))
+        sub["title_cn"] = str(s.get("title_cn") or "").strip() or f"场景 {sub['id']}"
+        out.append(sub)
+    return out[:6]
 
 
 def _merge_stage_b(plan, stage_b, env, cfg):
@@ -419,6 +551,25 @@ async def plan(user_text, env, cfg=None, images=None):
         content_b = await _chat_once(session, _role_cfg(llm_cfg, mode_b), msg_b, images=images)
         raw_b = _extract_json(content_b)
         plan = _merge_stage_b(plan, raw_b, env, cfg)
+
+        # Multi-scene: give each scene its own megaprompt via a dedicated Stage B call.
+        scenes = plan.get("scenes") or []
+        for sc in scenes:
+            sc_ctx = (
+                f"\n\nThis is SCENE {sc['id']} of {len(scenes)} ({sc.get('title_cn', '')}).\n"
+                f"Scene production parameters:\n{json.dumps({k: sc[k] for k in ('pipeline', 'duration_s', 'aspect', 'megapixels', 'sampler', 'steps')}, ensure_ascii=False)}\n"
+                "Write ONE megaprompt for THIS scene only (its own shots/camera/audio). Respond with the megaprompt JSON."
+            )
+            msg_s = [{"role": "system", "content": _STAGE_B_SYSTEM},
+                     {"role": "user", "content": _user_brief(user_text, sc_ctx)}]
+            content_s = await _chat_once(session, _role_cfg(llm_cfg, mode_b), msg_s, images=images)
+            raw_s = _extract_json(content_s)
+            sc["megaprompt"] = str(raw_s.get("megaprompt") or "").strip()
+            if not sc["megaprompt"]:
+                sc["megaprompt"] = plan.get("megaprompt", "")
+            kp = str(raw_s.get("keyframe_prompt") or "").strip()
+            if kp and sc["pipeline"] == "sdxl2v":
+                sc["keyframe_prompt"] = kp
 
         if dual and mode_c:
             c_ctx = (
