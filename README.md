@@ -106,6 +106,37 @@ Chat→Director-Plan→MiniMax H3 工作流的「总调度」扩展。在 ComfyU
 | POST | `/api/director/config` | `{config}` | 更新后的配置 |
 | GET  | `/api/director/models` | — | models/pipelines/gpu |
 
+## 安装
+
+1. 克隆到 ComfyUI 的 `custom_nodes` 目录:
+
+   ```powershell
+   cd D:\MiniMaxH3\ComfyUI_windows_portable\ComfyUI\custom_nodes
+   git clone https://github.com/toothless66/comfyui-total-director.git
+   ```
+
+2. 准备你自己的 MiniMax H3 工作流模板:`server/templates/` 下放你导出的
+   `h3_t2v.json` / `h3_i2v.json` / `h3_r2v.json`(save-format,含 subgraph)。
+3. 安装/运行 Ollama 并拉取要用的模型(见"多模型协调")。
+4. 重启 ComfyUI。面板会在画布左侧出现(快捷键 **Alt+D** 切换显隐)。
+
+## 使用方法(一键成片)
+
+1. **创作 tab**:输入一句话需求或分镜脚本,如
+   `一只机械鸟在雨夜霓虹城市上空盘旋,赛博朋克风,3秒短视频`。
+   - i2v/sdxl2v 可先在"附图"上传首帧或参考图。
+2. 点 **生成方案**:后端 LLM 返回导演方案(参数 + 英文 megaprompt + 中文备注),
+   显示在"方案"tab,可直接编辑。
+3. 点 **构建**:组装出可运行工作流并载入画布(可见、可手动微调)。
+4. 点 **一键成片**:自动提交队列执行并监控结果,完成后在面板内预览成片。
+   执行期间面板显示生成进度,完成后自动回收输出文件。
+
+## 调优建议
+
+- 8GB VRAM 建议 `build.default_megapixels: 0.2-0.4`,时长 ≤ 5s,避免爆显存。
+- 生成耗时较长(3-4 分钟)属正常;监控已按 prompt_id 精确判定,不会误报超时。
+- 想换 LLM:设置 tab 里改 `ollama_model` / `roles_mode` / `stage_*_model`,保存立即生效。
+
 ## 开发 & 测试
 
 用 ComfyUI 自带的 python(含 aiohttp):
