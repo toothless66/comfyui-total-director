@@ -1,0 +1,15 @@
+# Local config (may contain API keys / user paths)
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log

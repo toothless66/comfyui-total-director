@@ -1,0 +1,498 @@
+"""LLM brain: turns a natural-language brief / storyboard into a structured Director Plan.
+
+Two-stage design (robust on small local models):
+  Stage A — extract compact parameters as a small strict JSON.
+  Stage B — write the full English megaprompt (a 1-2 field JSON), which small models
+            fill reliably because there is little JSON overhead.
+
+Supports:
+  - Ollama (local), including vision models like qwen3-vl (image input)
+  - any OpenAI-compatible /chat/completions endpoint
+"""
+
+import asyncio
+import json
+import random
+
+import aiohttp
+
+from . import config
+
+
+class LLMError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+_ENV_HINT = """Available pipelines:
+- t2v   : text-to-video, no starting image
+- i2v   : image-to-video, animate a user-provided first-frame image
+- r2v   : reference-to-video, animate using 1-2 reference images
+- sdxl2v: full pipeline — first generate a keyframe still with SDXL, then animate it with H3
+
+Current environment:
+{env}"""
+
+_STAGE_A_SYSTEM = """You are the "Total Director", an expert AI video director embedded inside ComfyUI.
+Read the user's creative brief or storyboard script (Chinese or English) and emit ONE strict JSON object with the production parameters for a MiniMax H3 video (an omni-modal model that generates VIDEO with NATIVE STEREO AUDIO in one pass; hardware is RTX 5060 Laptop 8GB VRAM, keep resolution modest).
+
+{env_hint}
+
+# Constraints
+- duration_s: 1.0 to 15.0. Default 5.0.
+- aspect: one of "16:9","9:16","1:1","4:3","3:2","2:3","3:4","21:9"
+- megapixels: 0.2 to 0.6 (8GB VRAM friendly). Default 0.4.
+- sampler: "res_multistep" (default) or a reasonable sampler.
+- steps: 10-30, default 20.
+- A single H3 generation is one continuous take of a few seconds; do NOT plan minutes-long video.
+- Choose pipeline to match the brief. If the brief implies a starting image, prefer i2v. If the brief asks to fully auto-produce (concept -> finished video), prefer sdxl2v. Plain text-to-video stays t2v.
+
+# Output schema (STRICT JSON, no markdown fences, no extra text)
+{{
+  "pipeline": "t2v",
+  "summary_cn": "one short Chinese sentence summarizing the video concept",
+  "duration_s": 5.0,
+  "aspect": "16:9",
+  "megapixels": 0.4,
+  "sampler": "res_multistep",
+  "steps": 20,
+  "audio": "short English note on the sound design",
+  "notes_cn": "short Chinese production notes or warnings",
+  "keyframe_prompt": "only for sdxl2v: SDXL still-image prompt in English (subject, composition, style, lighting), otherwise empty string",
+  "keyframe_negative": "only for sdxl2v: standard SDXL negatives, otherwise empty string"
+}}"""
+
+_STAGE_B_SYSTEM = """You are a screenwriter who writes the actual prompt that a video diffusion model (MiniMax H3) reads. Write ONLY the English prompt text the model will read. Do not write meta-commentary.
+
+MiniMax H3 generates video WITH native stereo audio in one pass; it has only a positive prompt (no negative prompt). One generation = one continuous take of a few seconds. The prompt should cover shots, camera moves and the audio (ambience / SFX / music) together.
+
+Follow this exact structure:
+1) A one-line style / look block.
+2) A "Storyboard" with a shot list using timecodes like [0s-1.5s] Shot 1: ..., each shot describing action and camera.
+3) A "Camera:" line (hard cuts, no dissolves unless wanted, etc.).
+4) An "Audio:" paragraph (ambience, SFX, music, beats).
+5) A closing clause: no text/subtitles/logos/watermarks unless the brief explicitly needs on-screen text (then say the text must be legible), no cartoon look unless intended.
+
+Example:
+"Realistic live-action cinematic look, post-rain dusk metropolis, anamorphic lens, shallow depth of field, film grain, city volumetric fog.
+
+Storyboard:
+[0s-1.5s] Shot 1: high side angle, protagonist sprinting at the roof edge, pursuers appearing behind.
+[1s-2.5s] Shot 2: he leaps the gap between buildings, slight slow-motion, light trails behind.
+[2.5s-4s] Shot 3: low-angle, he lands, rolls and rises, keeps running.
+[4s-5s] Shot 4: freeze on the silhouette at the roof edge.
+
+Camera: hard cuts, each shot its own angle, slight frame jitter on jumps, no dissolves.
+
+Audio: wind, rapid footsteps, city ambience, low score, accent hit on each leap, score bursts at 4s.
+
+No text, subtitles, logos or watermarks, no animation/cartoon rendering, keep live-action texture."
+
+Rules:
+- English only. 80-250 words. NEVER use "..." or ellipses; every field fully spelled out.
+- For i2v / r2v with a reference image, describe motion relative to it ("the character in the reference image...") and preserve identity.
+- For sdxl2v: the megaprompt describes the MOTION / camera / audio starting from the keyframe still described by keyframe_prompt.
+
+Respond with ONE strict JSON object, no markdown fences:
+{{"megaprompt": "the full prompt", "keyframe_prompt": "optional SDXL still prompt only if the pipeline is sdxl2v, else empty string"}}
+keyframe_prompt must be empty string unless the pipeline is sdxl2v.
+MEGAPROMPT MUST BE COMPLETE — never abbreviated, no ellipsis."""
+
+_STAGE_C_SYSTEM = """You are the "Executive Producer / Implementer" of a video production team.
+A Director model (DeepSeek) already produced the production parameters and a megaprompt for a MiniMax H3 video (omni-modal: video + native stereo audio in one pass).
+
+Your job is to OPERATE / IMPLEMENT the plan: review it like an executive producer would, catch problems, and hand back a final polished megaprompt that is guaranteed to execute well on the real engine.
+
+# What to check
+- Continuity: shots, camera moves and audio must feel like one continuous take (H3 makes a few-second clip, not a feature).
+- Completeness: prompt must contain the style/look line, a timecoded storyboard, a Camera: line, and an Audio: paragraph.
+- Feasibility: hardware is RTX 5060 Laptop 8GB VRAM — keep resolution modest; do not invent resolutions, keep the given width/height.
+- Tone: live-action realism by default; keep a cartoon look only if the brief demanded it.
+- No text/subtitles/logos/watermarks unless the brief explicitly wants on-screen text.
+- If a first-frame or reference image was provided (i2v/r2v), the motion must be described RELATIVE to that image and identity preserved.
+
+# Rules
+- Do NOT change pipeline / aspect / duration / megapixels — those are locked by the Director.
+- You may rewrite wording, add missing audio/camera detail, fix impossible instructions, and shorten or expand for a better single-take flow.
+- English only. 80-300 words. Never abbreviate. No ellipses.
+
+Respond with ONE strict JSON object, no markdown fences:
+{{"megaprompt": "the final complete megaprompt", "review_cn": "one short Chinese sentence summarizing what you changed / confirmed"}}
+MEGAPROMPT MUST BE COMPLETE — never abbreviated, no ellipsis."""
+
+
+def _build_stage_a_system(env_text):
+    return _STAGE_A_SYSTEM.replace("{env_hint}", _ENV_HINT.replace("{env}", env_text))
+
+
+def _summarize_env(env):
+    lines = []
+    models = env.get("models", {})
+    for folder in ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras"):
+        items = models.get(folder) or []
+        if items:
+            lines.append(f"- {folder}: {', '.join(items[:8])}")
+    pipelines = env.get("pipelines", {})
+    avail = ", ".join(k for k, v in pipelines.items() if v.get("available"))
+    lines.append(f"- available pipelines: {avail}")
+    gpu = env.get("gpu") or []
+    if gpu:
+        lines.append(f"- gpu: {gpu[0].get('name')} {gpu[0].get('vram_total_gb')}GB VRAM")
+    ollama = env.get("ollama", {})
+    if ollama.get("running"):
+        lines.append(f"- local ollama models: {', '.join(ollama['models'])}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Async clients
+# ---------------------------------------------------------------------------
+
+async def _ollama_chat(session, host, model, messages, options=None, images=None):
+    # NOTE: qwen3-vl (thinking renderer) drops `images` on /api/chat but handles
+    # them correctly on /api/generate (verified: prompt_eval jumps from ~20 to
+    # ~1000 with an image). We rebuild the prompt for the generate endpoint.
+    last_user = messages[-1]["content"] if messages else ""
+    system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+    prompt = f"{system}\n\n{last_user}".strip() if system else last_user
+
+    # Reasoning models (deepseek-r1, etc.) collapse to a literal `{ }` when
+    # `format:json` forces structured decoding — verified on deepseek-r1:14b.
+    # Let them think, then parse the JSON out of `response`.
+    is_reasoner = "deepseek" in (model or "").lower()
+    use_json_format = not is_reasoner
+    think = is_reasoner or options.get("think", False)
+    if is_reasoner:
+        prompt += "\n\nRespond ONLY with the requested JSON object. No extra text."
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "format": "json" if use_json_format else None,
+        "stream": False,
+        "think": think,
+        "options": {
+            "temperature": options.get("temperature", 0.5),
+            "num_predict": options.get("num_predict", 4096),
+            "num_ctx": options.get("num_ctx", 8192),
+        },
+    }
+    if images:
+        payload["images"] = images
+    try:
+        async with session.post(f"{host}/api/generate", json=payload, timeout=aiohttp.ClientTimeout(total=900)) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise LLMError(f"Ollama HTTP {resp.status}: {text[:300]}")
+            data = await resp.json()
+            # qwen3-vl (and other reasoning models) sometimes put the answer in
+            # the `thinking` field even with think=false; fall back to it.
+            return data.get("response") or data.get("thinking") or ""
+    except asyncio.TimeoutError:
+        raise LLMError("Ollama timeout after 900s (model too slow?)")
+    except aiohttp.ClientError as e:
+        raise LLMError(f"Ollama connection error: {e}")
+
+
+async def _api_chat(session, cfg, messages, images=None):
+    base = (cfg.get("api_base") or "").rstrip("/")
+    key = cfg.get("api_key") or ""
+    model = cfg.get("api_model") or "deepseek-chat"
+    if not key:
+        raise LLMError("API provider chosen but api_key is empty")
+
+    if images and cfg.get("vision_enabled"):
+        content = [{"type": "text", "text": messages[-1]["content"]}]
+        for img in images:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
+        payload_messages = messages[:-1] + [{"role": "user", "content": content}]
+    else:
+        payload_messages = messages
+
+    url = base + "/chat/completions" if "/chat/completions" not in base else base
+    payload = {
+        "model": model,
+        "messages": payload_messages,
+        "temperature": cfg.get("temperature", 0.5),
+        "response_format": {"type": "json_object"},
+        "max_tokens": cfg.get("num_predict", 4096),
+    }
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=900)) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise LLMError(f"API HTTP {resp.status}: {text[:300]}")
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"]
+    except asyncio.TimeoutError:
+        raise LLMError("API request timed out after 900s")
+    except (KeyError, IndexError) as e:
+        raise LLMError(f"Unexpected API response shape: {e}")
+    except aiohttp.ClientError as e:
+        raise LLMError(f"API connection error: {e}")
+
+
+def _extract_json(text):
+    if not text or not text.strip():
+        raise LLMError("LLM returned empty content")
+    text = text.strip().lstrip("`").rstrip("`")
+    if text.upper().startswith("JSON"):
+        text = text[4:].lstrip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise LLMError("LLM did not return a JSON object")
+    return json.loads(text[start:end + 1])
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+_ASPECT_LABELS = {
+    "1:1": "1:1 (Square)", "2:3": "2:3 (Portrait Photo)", "3:2": "3:2 (Photo)",
+    "3:4": "3:4 (Portrait Standard)", "4:3": "4:3 (Standard)",
+    "9:16": "9:16 (Portrait Widescreen)", "16:9": "16:9 (Widescreen)",
+    "21:9": "21:9 (Ultrawide)",
+}
+
+
+def normalize_plan(raw, env, cfg):
+    """Clamp & fill a raw plan dict so it is safe to build a workflow from."""
+    build = cfg.get("build", {})
+    pipelines = env.get("pipelines", {})
+
+    pipeline = str(raw.get("pipeline") or "t2v").lower().strip()
+    if pipeline not in pipelines:
+        pipeline = "t2v"
+    if not pipelines.get(pipeline, {}).get("available"):
+        for cand in ("t2v", "i2v", "r2v", "sdxl2v"):
+            if pipelines.get(cand, {}).get("available"):
+                pipeline = cand
+                break
+        else:
+            pipeline = "t2v"
+
+    try:
+        duration = float(raw.get("duration_s") or build.get("default_duration_s", 5.0))
+    except (TypeError, ValueError):
+        duration = 5.0
+    duration = max(float(build.get("min_duration_s", 1.0)),
+                   min(float(build.get("max_duration_s", 15.0)), duration))
+
+    aspect = str(raw.get("aspect") or build.get("default_aspect", "16:9"))
+    aspect_label = _ASPECT_LABELS.get(aspect)
+    if not aspect_label:
+        for k, v in _ASPECT_LABELS.items():
+            if v == aspect:
+                aspect_label, aspect = v, k
+                break
+        if not aspect_label:
+            aspect, aspect_label = "16:9", _ASPECT_LABELS["16:9"]
+
+    try:
+        mp = float(raw.get("megapixels") or build.get("default_megapixels", 0.4))
+    except (TypeError, ValueError):
+        mp = 0.4
+    mp = max(0.2, min(0.6, mp))
+
+    sampler = str(raw.get("sampler") or build.get("sampler", "res_multistep"))
+    try:
+        steps = int(raw.get("steps") or build.get("steps", 20))
+    except (TypeError, ValueError):
+        steps = 20
+    steps = max(4, min(60, steps))
+
+    try:
+        seed = int(raw.get("seed") or 0)
+    except (TypeError, ValueError):
+        seed = 0
+    if not seed:
+        seed = random.randint(1, 2 ** 53 - 1)
+
+    return {
+        "pipeline": pipeline,
+        "summary_cn": str(raw.get("summary_cn") or "").strip() or f"{pipeline} 视频",
+        "duration_s": round(duration, 1),
+        "aspect": aspect,
+        "aspect_label": aspect_label,
+        "megapixels": mp,
+        "sampler": sampler,
+        "steps": steps,
+        "seed": seed,
+        "audio": str(raw.get("audio") or "").strip(),
+        "notes_cn": str(raw.get("notes_cn") or "").strip(),
+        "keyframe_prompt": str(raw.get("keyframe_prompt") or "").strip(),
+        "keyframe_negative": str(raw.get("keyframe_negative") or "").strip()
+        or str(build.get("sdxl_negative") or ""),
+    }
+
+
+def _merge_stage_b(plan, stage_b, env, cfg):
+    plan["megaprompt"] = str(stage_b.get("megaprompt") or "").strip()
+    if not plan["megaprompt"]:
+        raise LLMError("LLM did not produce a megaprompt")
+    if plan["pipeline"] == "sdxl2v":
+        kp = str(stage_b.get("keyframe_prompt") or "").strip()
+        if kp:
+            plan["keyframe_prompt"] = kp
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def _chat_once(session, cfg, messages, images=None):
+    if cfg.get("provider") == "api":
+        return await _api_chat(session, cfg, messages, images=images)
+    return await _ollama_chat(
+        session, cfg.get("ollama_host", "http://127.0.0.1:11434"),
+        cfg.get("ollama_model", "qwen3-vl:8b"), messages, cfg, images=images)
+
+
+def _role_cfg(llm_cfg, role_model):
+    """Return an effective per-role LLM config, inheriting top-level settings.
+
+    role_model may be empty -> fall back to the top-level model so a missing
+    role never breaks the request. Everything else (provider, host, api keys)
+    is inherited from the top-level llm config.
+    """
+    cfg = dict(llm_cfg)
+    if role_model:
+        cfg["ollama_model"] = role_model
+        cfg["api_model"] = role_model
+    return cfg
+
+
+def _role_models(llm_cfg):
+    """Resolve the per-role models for the current roles_mode."""
+    mode = (llm_cfg.get("roles_mode") or "single").lower()
+    if mode != "dual":
+        return None, llm_cfg.get("ollama_model"), llm_cfg.get("api_model")
+    return (
+        llm_cfg.get("stage_a_model") or llm_cfg.get("ollama_model"),
+        llm_cfg.get("stage_b_model") or llm_cfg.get("ollama_model"),
+        llm_cfg.get("stage_c_model") or llm_cfg.get("ollama_model"),
+    )
+
+
+def _user_brief(user_text, extra=""):
+    return (
+        "User brief / storyboard script:\n"
+        "------------------------------------\n"
+        f"{user_text}\n"
+        "------------------------------------\n"
+        + extra
+    )
+
+
+async def plan(user_text, env, cfg=None, images=None):
+    """Two-stage Director Plan generation (optionally coordinated across two models)."""
+    cfg = cfg or config.get()
+    llm_cfg = cfg.get("llm", {})
+    env_text = _summarize_env(env)
+    stage_a_system = _build_stage_a_system(env_text)
+
+    mode_a, mode_b, mode_c = _role_models(llm_cfg)
+    dual = llm_cfg.get("roles_mode", "single").lower() == "dual"
+
+    msg_a = [{"role": "system", "content": stage_a_system},
+             {"role": "user", "content": _user_brief(user_text, "Respond with the parameter JSON.")}]
+    msg_b = [{"role": "system", "content": _STAGE_B_SYSTEM},
+             {"role": "user", "content": _user_brief(user_text, "")}]
+
+    async with aiohttp.ClientSession() as session:
+        content_a = await _chat_once(session, _role_cfg(llm_cfg, mode_a), msg_a, images=images)
+        raw_a = _extract_json(content_a)
+        plan = normalize_plan(raw_a, env, cfg)
+
+        b_ctx = (
+            f"\n\nChosen production parameters:\n{json.dumps({k: plan[k] for k in ('pipeline', 'duration_s', 'aspect', 'megapixels', 'sampler', 'steps')}, ensure_ascii=False)}\n"
+            f"keyframe_prompt (if any): {plan['keyframe_prompt']}\n"
+            "Now respond with the megaprompt JSON."
+        )
+        msg_b[1]["content"] = _user_brief(user_text, b_ctx)
+        content_b = await _chat_once(session, _role_cfg(llm_cfg, mode_b), msg_b, images=images)
+        raw_b = _extract_json(content_b)
+        plan = _merge_stage_b(plan, raw_b, env, cfg)
+
+        if dual and mode_c:
+            c_ctx = (
+                f"\n\nProduction parameters:\n{json.dumps({k: plan[k] for k in ('pipeline', 'duration_s', 'aspect', 'megapixels', 'sampler', 'steps')}, ensure_ascii=False)}\n"
+                f"Draft megaprompt:\n{plan['megaprompt']}\n"
+                "Review, fix and return the final megaprompt JSON."
+            )
+            msg_c = [{"role": "system", "content": _STAGE_C_SYSTEM},
+                     {"role": "user", "content": _user_brief(user_text, c_ctx)}]
+            content_c = await _chat_once(session, _role_cfg(llm_cfg, mode_c), msg_c, images=images)
+            raw_c = _extract_json(content_c)
+            if str(raw_c.get("megaprompt") or "").strip():
+                plan["megaprompt"] = str(raw_c["megaprompt"]).strip()
+                review = str(raw_c.get("review_cn") or "").strip()
+                if review:
+                    plan["notes_cn"] = ((plan.get("notes_cn") or "") + " | 终审: " + review).strip(" |")
+
+    if dual:
+        plan["_meta"] = {"provider": llm_cfg.get("provider"), "model": mode_b,
+                         "roles": {"stage_a": mode_a, "stage_b": mode_b, "stage_c": mode_c}}
+    else:
+        plan["_meta"] = {"provider": llm_cfg.get("provider"), "model": llm_cfg.get("ollama_model" if llm_cfg.get("provider") != "api" else "api_model")}
+    return plan
+
+
+async def refine_plan(previous_plan, instruction, env, cfg=None):
+    """Apply a natural-language adjustment to an existing plan, keeping the megaprompt."""
+    cfg = cfg or config.get()
+    llm_cfg = cfg.get("llm", {})
+    env_text = _summarize_env(env)
+
+    mode_a, mode_b, mode_c = _role_models(llm_cfg)
+    dual = llm_cfg.get("roles_mode", "single").lower() == "dual"
+
+    msg_a = [{"role": "system", "content": _build_stage_a_system(env_text)},
+             {"role": "user", "content": (
+                 "Current production parameters:\n"
+                 f"{json.dumps({k: v for k, v in previous_plan.items() if k in ('pipeline', 'duration_s', 'aspect', 'megapixels', 'sampler', 'steps')}, ensure_ascii=False)}\n\n"
+                 f"User adjustment request: {instruction}\n\n"
+                 "Return the FULL updated parameter JSON (all fields, same schema).")}]
+
+    async with aiohttp.ClientSession() as session:
+        content_a = await _chat_once(session, _role_cfg(llm_cfg, mode_a), msg_a)
+        raw_a = _extract_json(content_a)
+        plan = normalize_plan(raw_a, env, cfg)
+
+        msg_b = [{"role": "system", "content": _STAGE_B_SYSTEM},
+                 {"role": "user", "content": _user_brief(
+                     f"{previous_plan.get('summary_cn', '')} | adjustment: {instruction}",
+                     f"\n\nChosen production parameters:\n{json.dumps({k: plan[k] for k in ('pipeline', 'duration_s', 'aspect', 'megapixels')}, ensure_ascii=False)}\n"
+                     "Rewrite the megaprompt to match; respond with the megaprompt JSON.")}]
+        content_b = await _chat_once(session, _role_cfg(llm_cfg, mode_b), msg_b)
+        raw_b = _extract_json(content_b)
+        plan = _merge_stage_b(plan, raw_b, env, cfg)
+
+        if dual and mode_c:
+            c_ctx = (
+                f"\n\nProduction parameters:\n{json.dumps({k: plan[k] for k in ('pipeline', 'duration_s', 'aspect', 'megapixels', 'sampler', 'steps')}, ensure_ascii=False)}\n"
+                f"Rewritten megaprompt:\n{plan['megaprompt']}\n"
+                "Review, fix and return the final megaprompt JSON."
+            )
+            msg_c = [{"role": "system", "content": _STAGE_C_SYSTEM},
+                     {"role": "user", "content": _user_brief(f"{previous_plan.get('summary_cn', '')} | adjustment: {instruction}", c_ctx)}]
+            content_c = await _chat_once(session, _role_cfg(llm_cfg, mode_c), msg_c)
+            raw_c = _extract_json(content_c)
+            if str(raw_c.get("megaprompt") or "").strip():
+                plan["megaprompt"] = str(raw_c["megaprompt"]).strip()
+                review = str(raw_c.get("review_cn") or "").strip()
+                if review:
+                    plan["notes_cn"] = ((plan.get("notes_cn") or "") + " | 终审: " + review).strip(" |")
+
+    if dual:
+        plan["_meta"] = {"provider": llm_cfg.get("provider"), "model": mode_b,
+                         "roles": {"stage_a": mode_a, "stage_b": mode_b, "stage_c": mode_c}}
+    else:
+        plan["_meta"] = {"provider": llm_cfg.get("provider"), "model": llm_cfg.get("ollama_model" if llm_cfg.get("provider") != "api" else "api_model")}
+    return plan
